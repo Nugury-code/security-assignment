@@ -9,8 +9,15 @@
 //           서버로 전송되지 않는다 — WebAuthn 표준 자체가 개인키를 기기 밖으로
 //           내보내지 않는 방식으로 설계되어 있다.
 //
-// 아직 안 한 것(카드 3에서 이어감): 이 등록한 패스키로 실제 "로그인"해서
-// /api/private을 통과시키는 부분. 지금은 등록만 되고, 로그인 연결은 다음 단계.
+// 카드 3: 패스키 "로그인" 절차를 구현한다.
+//         - 로그인 시도마다 서버가 새 질문을 만들어 보내고, 딱 한 번만 쓸 수 있다
+//           (검증 성공/실패 상관없이 바로 폐기 — 재사용·재생 공격 방지).
+//         - 브라우저가 개인키로 서명한 응답을, 저장해 둔 공개키로 확인한다
+//           (verifyAuthenticationResponse). 통과해야만 sid 쿠키를 "로그인됨"으로
+//           표시하고, 그때부터 /api/private이 401 대신 진짜 내용을 돌려준다.
+//         - "로그인됨" 표시는 서버 메모리의 세션(authenticatedSids)으로 하며,
+//           비밀번호·패스키 원문이 아니라 무작위로 생성된 sid 쿠키 값 하나로만
+//           사람을 알아본다. 로그아웃하면 그 표시를 지운다.
 //
 // ⚠️ 알아두어야 할 점: 지금 /register.html과 /api/register/* 는 누구나 접근할 수 있다.
 // 즉 이 사이트를 실제로 배포한 뒤에는, 아무나 이 페이지에 들어와서 "자기" 패스키를
@@ -24,7 +31,9 @@ const path = require('path');
 const crypto = require('crypto');
 const {
   generateRegistrationOptions,
-  verifyRegistrationResponse
+  verifyRegistrationResponse,
+  generateAuthenticationOptions,
+  verifyAuthenticationResponse
 } = require('@simplewebauthn/server');
 
 const PORT = process.env.PORT || 3000;
@@ -45,6 +54,15 @@ const PRIVATE_ITEMS = [
 // "등록 도중"의 임시 상태일 뿐이라 파일로 저장할 필요가 없다.
 const pendingChallenges = new Map();
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
+
+// 로그인 중간에만 잠깐 살아있는 challenge 저장소(등록용과 별개). sid당 하나,
+// 검증 뒤(성공이든 실패든) 바로 지워서 같은 질문을 두 번 못 쓰게 한다.
+const pendingLoginChallenges = new Map();
+
+// "로그인됨" 표시. sid -> 만료 시각(ms). 비밀번호도, 패스키 원문도 아니고
+// 그냥 무작위 문자열(sid)과 시각 하나로만 사람을 구분한다 — 이게 우리 세션이다.
+const authenticatedSids = new Map();
+const SESSION_TTL_MS = 30 * 60 * 1000; // 30분 뒤 자동 로그아웃
 
 // ---------- 저장된 패스키(공개키) 읽기/쓰기 ----------
 
@@ -169,10 +187,15 @@ const server = http.createServer(async (req, res) => {
   const urlPath = req.url.split('?')[0];
 
   try {
-    // 카드 1: 비공개 자료 — 아직 로그인 수단이 없으므로 언제나 거절한다.
+    // 카드 1 → 카드 3: 비공개 자료 — 로그인 세션이 유효할 때만 내용을 돌려준다.
     if (urlPath === '/api/private') {
-      // TODO(카드 3): 여기서 로그인 세션을 확인해서, 유효하면 401 대신
-      // sendJson(res, 200, { items: PRIVATE_ITEMS })를 돌려주도록 바꾼다.
+      const cookies = parseCookies(req);
+      const sid = cookies.sid;
+      const expiresAt = sid && authenticatedSids.get(sid);
+      if (expiresAt && expiresAt > Date.now()) {
+        return sendJson(res, 200, { items: PRIVATE_ITEMS });
+      }
+      if (expiresAt) authenticatedSids.delete(sid); // 만료된 세션 정리
       return sendJson(res, 401, { error: 'unauthorized', message: '패스키 로그인이 필요합니다.' });
     }
 
@@ -264,6 +287,90 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         items: stored.map((c) => ({ name: c.name, createdAt: c.createdAt }))
       });
+    }
+
+    // 카드 3: 패스키 로그인 — 1) 서버가 로그인용 질문(challenge)을 만들어 보낸다.
+    if (urlPath === '/api/login/options' && req.method === 'GET') {
+      const sid = ensureSid(req, res);
+      const existing = loadCredentials();
+
+      if (existing.length === 0) {
+        return sendJson(res, 400, { error: 'no_credentials', message: '등록된 패스키가 없습니다. 먼저 등록해 주세요.' });
+      }
+
+      const options = await generateAuthenticationOptions({
+        rpID: getRpID(req),
+        allowCredentials: existing.map((c) => ({ id: c.id })),
+        userVerification: 'preferred'
+      });
+
+      pendingLoginChallenges.set(sid, { challenge: options.challenge, createdAt: Date.now() });
+      return sendJson(res, 200, options);
+    }
+
+    // 카드 3: 패스키 로그인 — 2) 서명을 저장된 공개키로 확인하고, 맞으면 세션을 로그인 상태로 표시한다.
+    if (urlPath === '/api/login/verify' && req.method === 'POST') {
+      const cookies = parseCookies(req);
+      const sid = cookies.sid;
+      const pending = sid && pendingLoginChallenges.get(sid);
+
+      if (!pending) {
+        return sendJson(res, 400, { error: 'no_pending_challenge', message: '로그인을 다시 시작해 주세요.' });
+      }
+      // 성공하든 실패하든 이 질문은 바로 폐기한다 — 같은 질문으로 두 번 로그인 시도를 못 하게 막는 지점.
+      pendingLoginChallenges.delete(sid);
+
+      if (Date.now() - pending.createdAt > CHALLENGE_TTL_MS) {
+        return sendJson(res, 400, { error: 'challenge_expired', message: '시간이 너무 지났습니다. 다시 시도해 주세요.' });
+      }
+
+      const body = await readJsonBody(req);
+      if (!body.credential || !body.credential.id) {
+        return sendJson(res, 400, { error: 'credential_required' });
+      }
+
+      const stored = loadCredentials();
+      const match = stored.find((c) => c.id === body.credential.id);
+      if (!match) {
+        return sendJson(res, 400, { error: 'unknown_credential', message: '등록되지 않은 패스키입니다.' });
+      }
+
+      let verification;
+      try {
+        verification = await verifyAuthenticationResponse({
+          response: body.credential,
+          expectedChallenge: pending.challenge,
+          expectedOrigin: getOrigin(req),
+          expectedRPID: getRpID(req),
+          credential: {
+            id: match.id,
+            publicKey: Buffer.from(match.publicKey, 'base64'),
+            counter: match.counter
+          },
+          requireUserVerification: false
+        });
+      } catch (err) {
+        return sendJson(res, 400, { error: 'verification_error', message: String(err.message || err) });
+      }
+
+      if (!verification.verified) {
+        return sendJson(res, 400, { error: 'not_verified', message: '서명 확인에 실패했습니다.' });
+      }
+
+      // 재생 공격 방지용 카운터 갱신(다중 기기 동기화 패스키는 보통 0으로 고정되어 있을 수 있음).
+      match.counter = verification.authenticationInfo.newCounter;
+      saveCredentials(stored);
+
+      authenticatedSids.set(sid, Date.now() + SESSION_TTL_MS);
+      return sendJson(res, 200, { success: true });
+    }
+
+    // 로그아웃 — 이 sid의 "로그인됨" 표시만 지운다. 쿠키 자체도 만료시켜 정리한다.
+    if (urlPath === '/api/logout' && req.method === 'POST') {
+      const cookies = parseCookies(req);
+      if (cookies.sid) authenticatedSids.delete(cookies.sid);
+      res.setHeader('Set-Cookie', 'sid=; HttpOnly; Path=/; Max-Age=0');
+      return sendJson(res, 200, { success: true });
     }
 
     serveStatic(req, res);

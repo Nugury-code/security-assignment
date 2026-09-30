@@ -531,6 +531,12 @@
     <h2 class="section-title">나만 보는 자리</h2>
     <p class="private-status" id="private-status">확인하는 중…</p>
     <ul class="private-list" id="private-list" hidden></ul>
+    <button type="button" class="disclosure-btn" id="login-btn" hidden>
+      <span>패스키로 로그인</span>
+    </button>
+    <button type="button" class="disclosure-btn" id="logout-btn" hidden>
+      <span>로그아웃</span>
+    </button>
   </section>
 
   <footer class="card">
@@ -539,6 +545,7 @@
   </footer>
 
 </div>
+<script src="https://unpkg.com/@simplewebauthn/browser/dist/bundle/index.umd.min.js"></script>
 <script>
 (function(){
   var btn = document.getElementById('egg-story-toggle');
@@ -584,27 +591,98 @@
 (function(){
   var status = document.getElementById('private-status');
   var list = document.getElementById('private-list');
+  var loginBtn = document.getElementById('login-btn');
+  var logoutBtn = document.getElementById('logout-btn');
 
-  fetch('/api/private', { credentials: 'same-origin' })
-    .then(function(res){
-      if (res.ok){
-        return res.json().then(function(data){
-          list.innerHTML = '';
-          data.items.forEach(function(item){
-            var li = document.createElement('li');
-            li.textContent = item;
-            list.appendChild(li);
+  function checkPrivate(){
+    return fetch('/api/private', { credentials: 'same-origin' })
+      .then(function(res){
+        if (res.ok){
+          return res.json().then(function(data){
+            list.innerHTML = '';
+            data.items.forEach(function(item){
+              var li = document.createElement('li');
+              li.textContent = item;
+              list.appendChild(li);
+            });
+            list.hidden = false;
+            status.hidden = true;
+            loginBtn.hidden = true;
+            logoutBtn.hidden = false;
           });
-          list.hidden = false;
-          status.hidden = true;
+        }
+        list.hidden = true;
+        list.innerHTML = '';
+        status.hidden = false;
+        status.textContent = '잠겨 있습니다 (' + res.status + ') — 패스키로 로그인해야 볼 수 있는 자리입니다.';
+        loginBtn.hidden = false;
+        logoutBtn.hidden = true;
+      })
+      .catch(function(){
+        status.hidden = false;
+        status.textContent = '비공개 자료를 불러오지 못했습니다. 서버가 켜져 있는지 확인해 주세요.';
+      });
+  }
+
+  loginBtn.addEventListener('click', function(){
+    if (!window.SimpleWebAuthnBrowser){
+      status.textContent = '패스키 라이브러리를 불러오지 못했습니다. 네트워크 상태를 확인해 주세요.';
+      return;
+    }
+    if (!window.PublicKeyCredential){
+      status.textContent = '이 브라우저는 패스키(WebAuthn)를 지원하지 않습니다.';
+      return;
+    }
+
+    loginBtn.disabled = true;
+    status.hidden = false;
+    status.textContent = '로그인 창을 여는 중…';
+
+    fetch('/api/login/options', { credentials: 'same-origin' })
+      .then(function(res){
+        return res.json().then(function(d){
+          if (!res.ok) throw new Error(d.message || '로그인 옵션을 받지 못했습니다.');
+          return d;
         });
-      }
-      // 아직 패스키 로그인 기능이 없으므로(카드 2~3에서 추가 예정) 항상 이 분기를 탄다.
-      status.textContent = '잠겨 있습니다 (' + res.status + ') — 패스키로 로그인해야 볼 수 있는 자리입니다. 아직 로그인 기능은 연결 전입니다.';
-    })
-    .catch(function(){
-      status.textContent = '비공개 자료를 불러오지 못했습니다. 서버가 켜져 있는지 확인해 주세요.';
-    });
+      })
+      .then(function(optionsJSON){
+        return window.SimpleWebAuthnBrowser.startAuthentication({ optionsJSON: optionsJSON });
+      })
+      .then(function(credential){
+        return fetch('/api/login/verify', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ credential: credential })
+        });
+      })
+      .then(function(res){ return res.json().then(function(data){ return { ok: res.ok, data: data }; }); })
+      .then(function(result){
+        if (result.ok && result.data.success){
+          return checkPrivate();
+        }
+        status.textContent = '로그인 실패: ' + (result.data.message || result.data.error || '알 수 없는 오류');
+      })
+      .catch(function(err){
+        if (err && (err.name === 'NotAllowedError' || /cancel/i.test(String(err.message)))){
+          status.textContent = '로그인이 취소되었습니다.';
+        } else {
+          status.textContent = '오류: ' + (err.message || err);
+        }
+      })
+      .finally(function(){
+        loginBtn.disabled = false;
+      });
+  });
+
+  logoutBtn.addEventListener('click', function(){
+    logoutBtn.disabled = true;
+    fetch('/api/logout', { method: 'POST', credentials: 'same-origin' })
+      .then(checkPrivate)
+      .finally(function(){ logoutBtn.disabled = false; });
+  });
+
+  checkPrivate();
 })();
 </script>
 </body>
