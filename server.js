@@ -28,10 +28,24 @@
 //           로그인 세션이 있어야 가능한 보호라서, 삭제 기능을 만드는 지금 바로
 //           적용했다(등록 때는 이 보호 수단 자체가 아직 없어서 못 걸었던 것과 대비됨).
 //
+// 카드 5: 패스키(=계정)마다 서로 다른 비공개 자료를 갖도록 바꾼다.
+//         - 예전엔 로그인만 하면 누구든 똑같은 전역 PRIVATE_ITEMS 하나를 봤다.
+//           이제는 패스키 등록 하나하나가 "계정" 하나이고, 그 계정 전용
+//           privateItems 배열을 credentials.json에 함께 저장한다.
+//         - 등록 시 입력한 이름·등록 시각을 이용해 서버가 자동으로 기본 문구를
+//           만들어 넣는다(사람이 손으로 채워 넣지 않아도 계정마다 자연히 다른
+//           내용이 생김). 본인이 직접 고쳐 쓰는 기능은 다음 단계에서 추가한다.
+//         - 로그인 세션(authenticatedSids)도 "언제 만료되는지"뿐 아니라
+//           "어느 계정(credentialId)으로 로그인했는지"까지 함께 기억해야,
+//           /api/private이 그 계정의 자료만 돌려줄 수 있다.
+//         - 패스키 삭제도 이제 "전체 로그아웃"이 아니라 그 계정의 세션만 끊는다 —
+//           계정이 여러 개인 이상, 내 패스키를 지운 게 다른 계정의 로그인까지
+//           끊어버리면 안 되기 때문이다(카드 4 때는 계정이 하나뿐이라 몰랐던 부분).
+//
 // ⚠️ 알아두어야 할 점: 지금 /register.html과 /api/register/* 는 누구나 접근할 수 있다
 // (등록 자체는 로그인 여부와 상관없이 열려 있음). 즉 이 사이트를 실제로 배포한 뒤에는,
-// 아무나 이 페이지에 들어와서 "자기" 패스키를 등록해 비공개 영역에 들어올 수 있다는
-// 뜻이다. 배포 전에 반드시 이 등록 절차 자체를 나만 쓸 수 있게 막아야 한다 —
+// 아무나 이 페이지에 들어와서 "자기" 패스키를 등록해 자기만의 비공개 계정을 만들 수
+// 있다는 뜻이다. 배포 전에 반드시 이 등록 절차 자체를 나만 쓸 수 있게 막아야 한다 —
 // 아직 안 막은 상태이고, 이건 카드 5의 "아직 못 맞은 것"에 정직하게 적어야 할 부분이다.
 
 const http = require('http');
@@ -50,13 +64,17 @@ const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, 'data');
 const CREDENTIALS_FILE = path.join(DATA_DIR, 'credentials.json');
 
-// 비공개 영역에 들어갈 실제 내용물. index.html에는 절대 심지 않고 서버 메모리에만 둔다.
-// (지금은 예시로 채워 둔 자리표시자 — 나중에 실제 내용으로 바꾸면 됨)
-const PRIVATE_ITEMS = [
-  '진행 중인 프로젝트 메모: (예시) 공모전용 프로토타입 기획 초안 정리 중',
-  '지원 예정 회사·직무 목록: (예시) 관심 기업 리스트와 마감일 정리',
-  '최근 회고 노트: (예시) 이번 주 배운 점과 다음 주 목표'
-];
+// 계정(패스키)마다 비공개 자료가 따로 있어야 하므로, 전역으로 하나만 두던
+// PRIVATE_ITEMS는 없앤다. 대신 등록 시 이 함수로 계정별 기본 문구를 만들어
+// 그 계정의 credentials.json 항목에 함께 저장한다(아래 register/verify에서 사용).
+function defaultPrivateItems(name, createdAtISOString) {
+  const when = new Date(createdAtISOString).toLocaleString('ko-KR');
+  return [
+    `"${name}" 계정으로 등록된 나만의 자리입니다.`,
+    `이 패스키는 ${when}에 등록되었습니다.`,
+    '이 내용은 아직 자동으로 만들어진 기본 문구이며, 다음 단계에서 로그인한 뒤 직접 고쳐 쓸 수 있게 됩니다.'
+  ];
+}
 
 // 등록 중간에만 잠깐 살아있는 challenge 저장소. sid(세션 쿠키) 하나당 하나씩,
 // 검증에 성공하거나 5분이 지나면 사라진다. 서버가 재시작되면 당연히 다 날아간다 —
@@ -68,8 +86,10 @@ const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 // 검증 뒤(성공이든 실패든) 바로 지워서 같은 질문을 두 번 못 쓰게 한다.
 const pendingLoginChallenges = new Map();
 
-// "로그인됨" 표시. sid -> 만료 시각(ms). 비밀번호도, 패스키 원문도 아니고
-// 그냥 무작위 문자열(sid)과 시각 하나로만 사람을 구분한다 — 이게 우리 세션이다.
+// "로그인됨" 표시. sid -> { expiresAt, credentialId }. 비밀번호도, 패스키 원문도
+// 아니고 무작위 문자열(sid) + 만료 시각 + "어느 계정으로 로그인했는지"로만
+// 사람을 구분한다 — 이게 우리 세션이다. credentialId가 있어야 /api/private이
+// "그 계정"의 비공개 자료만 돌려줄 수 있다.
 const authenticatedSids = new Map();
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30분 뒤 자동 로그아웃
 
@@ -196,15 +216,24 @@ const server = http.createServer(async (req, res) => {
   const urlPath = req.url.split('?')[0];
 
   try {
-    // 카드 1 → 카드 3: 비공개 자료 — 로그인 세션이 유효할 때만 내용을 돌려준다.
+    // 카드 1 → 카드 3 → 카드 5: 비공개 자료 — 로그인 세션이 유효할 때, 그 세션이
+    // 로그인한 "계정(credentialId)"의 자료만 돌려준다. 다른 계정의 자료는 절대
+    // 섞이지 않는다(T08-C36~C41이 확인하려는 부분).
     if (urlPath === '/api/private') {
       const cookies = parseCookies(req);
       const sid = cookies.sid;
-      const expiresAt = sid && authenticatedSids.get(sid);
-      if (expiresAt && expiresAt > Date.now()) {
-        return sendJson(res, 200, { items: PRIVATE_ITEMS });
+      const session = sid && authenticatedSids.get(sid);
+      if (session && session.expiresAt > Date.now()) {
+        const stored = loadCredentials();
+        const account = stored.find((c) => c.id === session.credentialId);
+        if (!account) {
+          // 로그인해 있는 동안 그 패스키 자체가 삭제된 경우 — 더는 어느 계정도 아니다.
+          authenticatedSids.delete(sid);
+          return sendJson(res, 401, { error: 'unauthorized', message: '패스키 로그인이 필요합니다.' });
+        }
+        return sendJson(res, 200, { items: account.privateItems || [] });
       }
-      if (expiresAt) authenticatedSids.delete(sid); // 만료된 세션 정리
+      if (session) authenticatedSids.delete(sid); // 만료된 세션 정리
       return sendJson(res, 401, { error: 'unauthorized', message: '패스키 로그인이 필요합니다.' });
     }
 
@@ -275,6 +304,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const { credential, credentialDeviceType, credentialBackedUp } = verification.registrationInfo;
+      const createdAt = new Date().toISOString();
       const stored = loadCredentials();
       stored.push({
         id: credential.id, // 공개 식별자(Base64URL) — 비밀번호 아님
@@ -283,7 +313,9 @@ const server = http.createServer(async (req, res) => {
         deviceType: credentialDeviceType,
         backedUp: credentialBackedUp,
         name,
-        createdAt: new Date().toISOString()
+        createdAt,
+        // 카드 5: 이 계정만의 비공개 자료. 등록 시 자동으로 기본 문구를 채워 넣는다.
+        privateItems: defaultPrivateItems(name, createdAt)
       });
       saveCredentials(stored);
 
@@ -303,8 +335,8 @@ const server = http.createServer(async (req, res) => {
     if (urlPath === '/api/passkeys' && req.method === 'DELETE') {
       const cookies = parseCookies(req);
       const sid = cookies.sid;
-      const expiresAt = sid && authenticatedSids.get(sid);
-      if (!expiresAt || expiresAt <= Date.now()) {
+      const session = sid && authenticatedSids.get(sid);
+      if (!session || session.expiresAt <= Date.now()) {
         return sendJson(res, 401, { error: 'unauthorized', message: '삭제하려면 먼저 메인 페이지에서 패스키로 로그인해 주세요.' });
       }
 
@@ -325,10 +357,13 @@ const server = http.createServer(async (req, res) => {
       // 패스키를 하나 지웠다는 건 "그 기기를 더는 못 믿는다"는 뜻이다. 그런데 세션은
       // 로그인 시점에 이미 발급돼서 credentials.json과 상관없이 따로 살아있기 때문에,
       // 삭제 후에도 예전에 로그인해 둔 상태가 그대로 남아있을 수 있다(실제로 이 문제를
-      // 테스트하다가 발견함). 그래서 삭제가 한 번이라도 일어나면, 지금 로그인돼 있는
-      // 모든 세션을 전부 끊어서 다시 로그인하게 만든다 — 단일 소유자 사이트라 이렇게
-      // 해도 문제없고, "분실 기기 대비"라는 카드 4의 취지에 맞다.
-      authenticatedSids.clear();
+      // 테스트하다가 발견함). 그래서 지워진 그 계정으로 로그인해 있던 세션은 전부 끊는다.
+      // 카드 4 때는(계정이 하나뿐이라) 전체 세션을 다 끊었지만, 이제 계정이 여러 개일 수
+      // 있으므로 지워진 계정과 무관한 다른 계정의 로그인 세션까지 끊으면 안 된다 —
+      // 그건 계정 간 비공개 자료 분리(카드 5)와 맞지 않는 부작용이다.
+      for (const [otherSid, otherSession] of authenticatedSids) {
+        if (otherSession.credentialId === id) authenticatedSids.delete(otherSid);
+      }
 
       return sendJson(res, 200, { success: true, remaining: stored.length });
     }
@@ -405,7 +440,9 @@ const server = http.createServer(async (req, res) => {
       match.counter = verification.authenticationInfo.newCounter;
       saveCredentials(stored);
 
-      authenticatedSids.set(sid, Date.now() + SESSION_TTL_MS);
+      // 카드 5: 이 세션이 "어느 계정(match.id)"으로 로그인했는지 함께 기억해 둔다 —
+      // /api/private이 그 계정의 비공개 자료만 돌려줄 수 있게 하는 열쇠다.
+      authenticatedSids.set(sid, { expiresAt: Date.now() + SESSION_TTL_MS, credentialId: match.id });
       return sendJson(res, 200, { success: true });
     }
 
