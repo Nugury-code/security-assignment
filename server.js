@@ -227,7 +227,10 @@ const server = http.createServer(async (req, res) => {
           response: body.credential,
           expectedChallenge: pending.challenge,
           expectedOrigin: getOrigin(req),
-          expectedRPID: getRpID(req)
+          expectedRPID: getRpID(req),
+          // 등록 시 userVerification을 'preferred'(있으면 쓰고 없어도 통과)로 요청했으므로,
+          // 검증 단계에서도 이를 무조건 강제(true)하지 않도록 맞춘다.
+          requireUserVerification: false
         });
       } catch (err) {
         return sendJson(res, 400, { error: 'verification_error', message: String(err.message || err) });
