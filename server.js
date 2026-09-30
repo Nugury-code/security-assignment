@@ -18,12 +18,21 @@
 //         - "로그인됨" 표시는 서버 메모리의 세션(authenticatedSids)으로 하며,
 //           비밀번호·패스키 원문이 아니라 무작위로 생성된 sid 쿠키 값 하나로만
 //           사람을 알아본다. 로그아웃하면 그 표시를 지운다.
+// 카드 4: 기기를 잃어버렸을 때 대비 — 패스키를 여러 개 등록해두고, 하나를 지워도
+//         나머지로 들어갈 수 있게 한다.
+//         - 목록(GET /api/passkeys)에 각 패스키의 id·이름·등록일을 보여준다.
+//         - 삭제(DELETE /api/passkeys?id=...)는 credentials.json에서 그 항목만
+//           지운다. 지워진 id는 로그인 시 stored.find로 더는 못 찾으므로
+//           unknown_credential로 자동 거절된다(카드 3 코드를 그대로 재사용).
+//         - 등록과 달리 삭제는 "로그인된 상태"만 허용한다 — 이건 카드 3에서 만든
+//           로그인 세션이 있어야 가능한 보호라서, 삭제 기능을 만드는 지금 바로
+//           적용했다(등록 때는 이 보호 수단 자체가 아직 없어서 못 걸었던 것과 대비됨).
 //
-// ⚠️ 알아두어야 할 점: 지금 /register.html과 /api/register/* 는 누구나 접근할 수 있다.
-// 즉 이 사이트를 실제로 배포한 뒤에는, 아무나 이 페이지에 들어와서 "자기" 패스키를
-// 등록해 비공개 영역에 들어올 수 있다는 뜻이다. 카드 3까지 끝나고 나서(또는 배포 전에)
-// 반드시 이 등록 절차 자체를 나만 쓸 수 있게 막아야 한다 — 아직 안 막은 상태이고,
-// 이건 카드 5의 "아직 못 맞은 것"에 정직하게 적어야 할 부분이다.
+// ⚠️ 알아두어야 할 점: 지금 /register.html과 /api/register/* 는 누구나 접근할 수 있다
+// (등록 자체는 로그인 여부와 상관없이 열려 있음). 즉 이 사이트를 실제로 배포한 뒤에는,
+// 아무나 이 페이지에 들어와서 "자기" 패스키를 등록해 비공개 영역에 들어올 수 있다는
+// 뜻이다. 배포 전에 반드시 이 등록 절차 자체를 나만 쓸 수 있게 막아야 한다 —
+// 아직 안 막은 상태이고, 이건 카드 5의 "아직 못 맞은 것"에 정직하게 적어야 할 부분이다.
 
 const http = require('http');
 const fs = require('fs');
@@ -281,12 +290,47 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { success: true });
     }
 
-    // 등록된 패스키 목록(이름 + 등록일만 — 공개키 원문은 data/credentials.json 파일에서 직접 확인)
+    // 등록된 패스키 목록(이름 + 등록일 + 지울 때 쓸 id — 공개키 원문은 data/credentials.json 파일에서 직접 확인)
     if (urlPath === '/api/passkeys' && req.method === 'GET') {
       const stored = loadCredentials();
       return sendJson(res, 200, {
-        items: stored.map((c) => ({ name: c.name, createdAt: c.createdAt }))
+        items: stored.map((c) => ({ id: c.id, name: c.name, createdAt: c.createdAt }))
       });
+    }
+
+    // 카드 4: 패스키 삭제 — 기기를 잃어버렸을 때, 그 패스키를 목록에서 빼서 더는 못 쓰게 한다.
+    // 로그인된 상태에서만 지울 수 있게 막는다(그렇지 않으면 아무나 URL만 알아도 내 패스키를 지울 수 있음).
+    if (urlPath === '/api/passkeys' && req.method === 'DELETE') {
+      const cookies = parseCookies(req);
+      const sid = cookies.sid;
+      const expiresAt = sid && authenticatedSids.get(sid);
+      if (!expiresAt || expiresAt <= Date.now()) {
+        return sendJson(res, 401, { error: 'unauthorized', message: '삭제하려면 먼저 메인 페이지에서 패스키로 로그인해 주세요.' });
+      }
+
+      const params = new URLSearchParams(req.url.split('?')[1] || '');
+      const id = params.get('id');
+      if (!id) {
+        return sendJson(res, 400, { error: 'id_required' });
+      }
+
+      const stored = loadCredentials();
+      const idx = stored.findIndex((c) => c.id === id);
+      if (idx === -1) {
+        return sendJson(res, 404, { error: 'not_found', message: '해당 패스키를 찾을 수 없습니다.' });
+      }
+      stored.splice(idx, 1);
+      saveCredentials(stored);
+
+      // 패스키를 하나 지웠다는 건 "그 기기를 더는 못 믿는다"는 뜻이다. 그런데 세션은
+      // 로그인 시점에 이미 발급돼서 credentials.json과 상관없이 따로 살아있기 때문에,
+      // 삭제 후에도 예전에 로그인해 둔 상태가 그대로 남아있을 수 있다(실제로 이 문제를
+      // 테스트하다가 발견함). 그래서 삭제가 한 번이라도 일어나면, 지금 로그인돼 있는
+      // 모든 세션을 전부 끊어서 다시 로그인하게 만든다 — 단일 소유자 사이트라 이렇게
+      // 해도 문제없고, "분실 기기 대비"라는 카드 4의 취지에 맞다.
+      authenticatedSids.clear();
+
+      return sendJson(res, 200, { success: true, remaining: stored.length });
     }
 
     // 카드 3: 패스키 로그인 — 1) 서버가 로그인용 질문(challenge)을 만들어 보낸다.

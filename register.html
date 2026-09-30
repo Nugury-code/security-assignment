@@ -45,9 +45,28 @@
   #msg{ margin-top: 14px; font-size: 14px; }
   #msg.ok{ color: #1a7a3c; }
   #msg.err{ color: #b43c14; }
-  ul{ padding-left: 18px; }
-  li{ margin-bottom: 6px; font-size: 14px; }
-  .date{ color: #777; font-size: 12.5px; }
+  ul{ padding-left: 0; list-style: none; }
+  li{
+    margin-bottom: 8px;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 10px;
+    background: #f6f4fc;
+    border-radius: 8px;
+  }
+  .date{ color: #777; font-size: 12.5px; display: block; }
+  .del-btn{
+    background: none;
+    border: 1px solid #b43c14;
+    color: #b43c14;
+    padding: 5px 10px;
+    font-size: 12.5px;
+    border-radius: 6px;
+    flex-shrink: 0;
+  }
 </style>
 </head>
 <body>
@@ -62,6 +81,7 @@
   <div id="msg"></div>
 
   <h2 style="font-size:16px; margin-top:32px;">등록된 패스키 목록</h2>
+  <p style="font-size:13px; color:#777; margin-top:-4px;">삭제하려면 먼저 메인 페이지(<a href="/">/</a>)에서 패스키로 로그인한 뒤 이 탭으로 돌아와 주세요.</p>
   <ul id="pk-list"><li>불러오는 중…</li></ul>
 
 <script src="https://unpkg.com/@simplewebauthn/browser/dist/bundle/index.umd.min.js"></script>
@@ -83,13 +103,42 @@
       .then(function(data){
         list.innerHTML = '';
         if (!data.items || data.items.length === 0){
-          list.innerHTML = '<li>아직 등록된 패스키가 없습니다.</li>';
+          // 카드 4: 패스키가 하나도 안 남았을 때 화면에 분명하게 보여준다.
+          list.innerHTML = '<li>등록된 패스키가 하나도 없습니다. 이 상태에서는 아무도(본인 포함) 패스키로 로그인할 수 없습니다 — 위에서 새로 등록해 주세요.</li>';
           return;
         }
         data.items.forEach(function(item){
           var li = document.createElement('li');
           var d = new Date(item.createdAt);
-          li.innerHTML = item.name + ' <span class="date">(' + d.toLocaleString('ko-KR') + ' 등록)</span>';
+          var label = document.createElement('span');
+          label.innerHTML = item.name + '<span class="date">' + d.toLocaleString('ko-KR') + ' 등록</span>';
+          var delBtn = document.createElement('button');
+          delBtn.className = 'del-btn';
+          delBtn.textContent = '삭제';
+          delBtn.addEventListener('click', function(){
+            if (!confirm('"' + item.name + '" 패스키를 삭제할까요? 이 패스키를 등록한 기기는 더 이상 로그인에 쓸 수 없게 됩니다.')) return;
+            delBtn.disabled = true;
+            fetch('/api/passkeys?id=' + encodeURIComponent(item.id), {
+              method: 'DELETE',
+              credentials: 'same-origin'
+            })
+              .then(function(res){ return res.json().then(function(d2){ return { ok: res.ok, data: d2 }; }); })
+              .then(function(result){
+                if (result.ok && result.data.success){
+                  showMsg('삭제 완료: "' + item.name + '"', true);
+                  loadList();
+                } else {
+                  showMsg('삭제 실패: ' + (result.data.message || result.data.error || '알 수 없는 오류'), false);
+                  delBtn.disabled = false;
+                }
+              })
+              .catch(function(err){
+                showMsg('오류: ' + (err.message || err), false);
+                delBtn.disabled = false;
+              });
+          });
+          li.appendChild(label);
+          li.appendChild(delBtn);
           list.appendChild(li);
         });
       })

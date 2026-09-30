@@ -683,6 +683,12 @@
   });
 
   checkPrivate();
+
+  // 뒤로가기로 돌아왔을 때(브라우저가 페이지를 새로 안 불러오고 예전 화면을 그대로
+  // 복원하는 bfcache) 로그인 상태가 실제와 다르게 보일 수 있어서, 그 경우에도 다시 확인한다.
+  window.addEventListener('pageshow', function(e){
+    if (e.persisted) checkPrivate();
+  });
 })();
 </script>
 </body>
