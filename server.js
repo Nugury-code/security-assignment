@@ -252,7 +252,13 @@ const server = http.createServer(async (req, res) => {
         authenticatorSelection: {
           residentKey: 'preferred',
           userVerification: 'preferred'
-        }
+        },
+        // 기본값에는 Ed25519(-8)가 포함되는데, 일부 안드로이드 기기(구글 비밀번호
+        // 관리자)는 이를 지원하지 않으면서도 "지원하는 것만 골라 쓰기"가 아니라
+        // 통째로 등록을 거부해버린다("No available authenticator supported any of
+        // the specified pubKeyCredParams algorithms"). 널리 지원되는 ES256·RS256만
+        // 요청하도록 제한해서 이 문제를 피한다.
+        supportedAlgorithmIDs: [-7, -257]
       });
 
       pendingChallenges.set(sid, { challenge: options.challenge, createdAt: Date.now() });
