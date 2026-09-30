@@ -299,6 +299,40 @@
     margin-top: 5px;
   }
 
+  /* Private area — 공개 영역과 화면에서 바로 구분되도록 점선 테두리 + 잠금 아이콘 + 어두운 헤더를 씀 */
+  .private-section .card-content{
+    border: 2px dashed rgba(75,68,112,0.35);
+  }
+  .private-badge{
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--ink-muted);
+    background: rgba(93,43,199,0.08);
+    border: 1px solid var(--rule);
+    border-radius: 999px;
+    padding: 4px 12px;
+    margin-bottom: 14px;
+  }
+  .private-status{
+    font-size: 14.5px;
+    color: var(--ink-muted);
+    margin: 0;
+  }
+  .private-list{
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .private-list li{
+    padding: 10px 0;
+    font-size: 14.5px;
+    color: var(--ink);
+  }
+  .private-list li + li{ border-top: 1px solid var(--rule); }
+
   footer.card .card-content{
     padding: 20px 28px;
     color: var(--ink-muted);
@@ -492,6 +526,13 @@
     </div>
   </section>
 
+  <section class="card private-section" id="private-section">
+    <span class="private-badge">🔒 비공개 — 패스키 필요</span>
+    <h2 class="section-title">나만 보는 자리</h2>
+    <p class="private-status" id="private-status">확인하는 중…</p>
+    <ul class="private-list" id="private-list" hidden></ul>
+  </section>
+
   <footer class="card">
     <span>© 2026 원석연 · 이 페이지는 Claude(AI)와 함께 설계·구현했으며, 공개 범위와 내용에 대한 판단은 직접 했습니다.</span>
     <span>Last updated 2026</span>
@@ -535,6 +576,35 @@
     card.appendChild(front);
     card.appendChild(content);
   });
+})();
+
+// 비공개 자리: 화면에는 항상 "구역"만 미리 그려 두고, 실제 내용물은 절대 이 HTML 안에 심어두지 않는다.
+// /api/private 요청 결과에 따라서만 내용을 채우거나 잠금 문구를 보여준다.
+// → 로그인 전 페이지 소스를 봐도 비공개 내용이 전혀 들어있지 않다 (카드 1의 통과 기준 T08-C15, T08-C18).
+(function(){
+  var status = document.getElementById('private-status');
+  var list = document.getElementById('private-list');
+
+  fetch('/api/private', { credentials: 'same-origin' })
+    .then(function(res){
+      if (res.ok){
+        return res.json().then(function(data){
+          list.innerHTML = '';
+          data.items.forEach(function(item){
+            var li = document.createElement('li');
+            li.textContent = item;
+            list.appendChild(li);
+          });
+          list.hidden = false;
+          status.hidden = true;
+        });
+      }
+      // 아직 패스키 로그인 기능이 없으므로(카드 2~3에서 추가 예정) 항상 이 분기를 탄다.
+      status.textContent = '잠겨 있습니다 (' + res.status + ') — 패스키로 로그인해야 볼 수 있는 자리입니다. 아직 로그인 기능은 연결 전입니다.';
+    })
+    .catch(function(){
+      status.textContent = '비공개 자료를 불러오지 못했습니다. 서버가 켜져 있는지 확인해 주세요.';
+    });
 })();
 </script>
 </body>
